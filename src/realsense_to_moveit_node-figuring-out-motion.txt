@@ -1,0 +1,132 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <octomap/octomap.h>
+#include <octomap_msgs/msg/octomap.hpp>
+#include <octomap_msgs/conversions.h>
+#include <moveit_msgs/msg/planning_scene.hpp>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/passthrough.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <chrono>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2/exceptions.h>
+#include <tf2/LinearMath/Transform.h>
+
+class RealSenseToMoveItNode : public rclcpp::Node {
+public:
+    RealSenseToMoveItNode() : 
+        Node("realsense_to_moveit_node"), 
+        tree(0.05),
+        tfBuffer(this->get_clock()),
+        tfListener(tfBuffer) {
+        point_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            "/camera/camera/depth/color/points", 1, std::bind(&RealSenseToMoveItNode::pointCloudCallback, this, std::placeholders::_1));
+    }
+
+private:
+    void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
+
+        auto start = std::chrono::high_resolution_clock::now(); // Start timing
+
+        // Transform point cloud from camera frame to robot base frame
+        sensor_msgs::msg::PointCloud2 transformed_cloud_msg;
+        try {
+            tfBuffer.transform(*cloud_msg, transformed_cloud_msg, "camera_link", tf2::durationFromSec(1.0));
+        } catch (tf2::TransformException &ex) {
+            RCLCPP_WARN(this->get_logger(), "Could not transform point cloud: %s", ex.what());
+            return;
+        }
+
+        // Convert ROS point cloud to PCL point cloud
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::fromROSMsg(transformed_cloud_msg, *cloud);
+
+        // Get the sensor origin's transform relative to the robot's base frame
+        geometry_msgs::msg::TransformStamped transformStamped;
+        try {
+            transformStamped = tfBuffer.lookupTransform("camera_link", "base_link", rclcpp::Time(0), rclcpp::Duration(1, 0));
+        } catch (tf2::TransformException &ex) {
+            RCLCPP_ERROR(this->get_logger(), "Could not transform from %s to robot_base_frame: %s", cloud_msg->header.frame_id.c_str(), ex.what());
+            return;
+        }
+
+        // Use transformStamped to get the sensor's origin in robot_base_frame
+        octomap::point3d sensorOrigin(
+            transformStamped.transform.translation.x,
+            transformStamped.transform.translation.y,
+            transformStamped.transform.translation.z);
+
+        // Iterate through each point in the cloud
+        for (auto& point : *cloud) {
+
+            // Create the surface point for the ray
+            octomap::point3d surfacePoint(point.x, point.y, point.z);
+
+            // Check if the surface point is within the sensor range to be considered
+            if (sensorOrigin.distance(surfacePoint) <= maxRange) {
+
+                // Compute the direction
+                octomap::point3d direction = surfacePoint - sensorOrigin;
+                direction.normalize();
+
+                // Compute the end point of the ray by extending to the maximum range
+                octomap::point3d endPoint = surfacePoint + direction * maxRange;
+
+                // Update all nodes along the line as occupied
+                octomap::KeyRay keyRay;
+                if (tree.computeRayKeys(surfacePoint, endPoint, keyRay)) {
+                    for (auto key : keyRay) {
+                        tree.updateNode(key, true, true);  // Set nodes as occupied
+                    }
+                }
+                // Also ensure the endpoint itself is marked as occupied
+                tree.updateNode(endPoint, true, true);
+            }
+        }
+
+        tree.updateInnerOccupancy();
+
+        // Stop timing and calculate the elapsed time
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        RCLCPP_INFO(this->get_logger(), "Processing time: %ld ms", duration.count());
+
+        // Prepare the OctoMap message
+        octomap_msgs::msg::Octomap octomap_msg;
+        octomap_msg.header.frame_id = cloud_msg->header.frame_id;
+        octomap_msg.header.stamp = this->get_clock()->now();
+
+        // Fill the OctoMap message
+        octomap_msgs::binaryMapToMsg(tree, octomap_msg);
+
+        moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+        moveit_msgs::msg::PlanningScene planning_scene_msg;
+        planning_scene_msg.world.octomap.octomap = octomap_msg;
+        planning_scene_msg.world.octomap.header.frame_id = cloud_msg->header.frame_id;
+        planning_scene_msg.is_diff = true;
+
+        planning_scene_interface.applyPlanningScene(planning_scene_msg);
+    }
+
+
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_sub_;
+    octomap::OcTree tree;
+    tf2_ros::Buffer tfBuffer;
+    tf2_ros::TransformListener tfListener{tfBuffer};
+    octomap::point3d sensorOrigin; // This should be set according to your setup
+    double maxRange = 1.0; // Set this according to your sensor's range
+    std::string base_frame = "base_link"; // Replace with your robot's base frame ID
+};
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<RealSenseToMoveItNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

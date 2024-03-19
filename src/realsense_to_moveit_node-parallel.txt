@@ -1,0 +1,150 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <octomap/octomap.h>
+#include <octomap_msgs/msg/octomap.hpp>
+#include <octomap_msgs/conversions.h>
+#include <moveit_msgs/msg/planning_scene.hpp>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/passthrough.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <chrono>
+#include <future>
+#include <vector>
+#include <octomap/OcTree.h>
+
+class RealSenseToMoveItNode : public rclcpp::Node {
+public:
+    RealSenseToMoveItNode() : Node("realsense_to_moveit_node") {
+        point_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            "/camera/camera/depth/color/points", 1, std::bind(&RealSenseToMoveItNode::pointCloudCallback, this, std::placeholders::_1));
+    }
+
+private:
+    void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
+
+        // auto start = std::chrono::high_resolution_clock::now(); // Start timing
+
+        // Convert ROS point cloud to PCL point cloud
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::fromROSMsg(*cloud_msg, *cloud);
+
+        // Define the camera sensor origin
+        octomap::point3d sensorOrigin(0, 0, 0);
+
+        // Define the maximum range to clip
+        double maxRange = 1.0;
+
+        // Parallel processing
+        const size_t numThreads = 1;
+        // const size_t numThreads = std::thread::hardware_concurrency();
+        // RCLCPP_INFO(this->get_logger(), "numThreads: %ld", numThreads);
+
+        // Create a vector to store thread-local octree pointers
+        std::vector<std::unique_ptr<octomap::OcTree>> localTrees(numThreads);
+        for (auto& tree : localTrees) {
+            tree = std::make_unique<octomap::OcTree>(0.05);
+        }
+
+        size_t chunkSize = cloud->size() / numThreads;
+        std::vector<std::thread> threads;
+
+        for (size_t i = 0; i < numThreads; ++i) {
+            size_t startIdx = i * chunkSize;
+            size_t endIdx = (i + 1 == numThreads) ? cloud->size() : (i + 1) * chunkSize;
+
+            threads.emplace_back([&, startIdx, endIdx, i] {
+                for (size_t j = startIdx; j < endIdx; ++j) {
+                    const pcl::PointXYZ& point = (*cloud)[j];
+                    if (isInFieldOfView(point, sensorOrigin, maxRange, 0.994838)) {
+                        processPoint(*localTrees[i], point);
+                    }
+                }
+            });
+        }
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        // Merge thread-local trees into the main tree
+        octomap::OcTree tree(0.05);
+        for (auto& localTree : localTrees) {
+            for (octomap::OcTree::leaf_iterator it = localTree->begin_leafs(), end = localTree->end_leafs(); it != end; ++it) {
+                if (localTree->isNodeOccupied(*it)) {
+                    tree.updateNode(it.getKey(), true);
+                }
+            }
+        }
+
+        tree.updateInnerOccupancy();
+
+        // Stop timing and calculate the elapsed time
+        // auto end = std::chrono::high_resolution_clock::now();
+        // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        // RCLCPP_INFO(this->get_logger(), "Processing time: %ld ms", duration.count());
+
+        // Prepare the OctoMap message
+        octomap_msgs::msg::Octomap octomap_msg;
+        octomap_msg.header.frame_id = cloud_msg->header.frame_id;
+        octomap_msg.header.stamp = this->get_clock()->now();
+
+        // Fill the OctoMap message
+        octomap_msgs::binaryMapToMsg(tree, octomap_msg);
+
+        moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+        moveit_msgs::msg::PlanningScene planning_scene_msg;
+        planning_scene_msg.world.octomap.octomap = octomap_msg;
+        planning_scene_msg.world.octomap.header.frame_id = cloud_msg->header.frame_id;
+        planning_scene_msg.is_diff = true;
+
+        planning_scene_interface.applyPlanningScene(planning_scene_msg);
+    }
+
+    void processPoint(octomap::OcTree &tree, const pcl::PointXYZ &point) {
+        octomap::point3d sensorOrigin(0, 0, 0);
+        double maxRange = 1.0;
+
+        octomap::point3d surfacePoint(point.x, point.y, point.z);
+        if (sensorOrigin.distance(surfacePoint) <= maxRange) {
+            octomap::point3d direction = surfacePoint - sensorOrigin;
+            direction.normalize();
+            octomap::point3d endPoint = surfacePoint + direction * maxRange;
+
+            octomap::KeyRay keyRay;
+            if (tree.computeRayKeys(surfacePoint, endPoint, keyRay)) {
+                for (auto key : keyRay) {
+                    tree.updateNode(key, true, true);
+                }
+            }
+            tree.updateNode(endPoint, true, true);
+        }
+    }
+
+    // Function to check if a point is within the camera's FOV
+    bool isInFieldOfView(const pcl::PointXYZ &point, const octomap::point3d& sensorOrigin, double maxRange, double fovAngle) {
+        // Example check: simple radial distance and angle calculation
+        // For a more accurate FOV check, you would also consider horizontal and vertical angles
+        octomap::point3d surfacePoint(point.x, point.y, point.z);
+        double distance = sensorOrigin.distance(surfacePoint);
+        if (distance > maxRange) {
+            return false;
+        }
+
+        // Example angle check, assuming fovAngle is in radians and represents the total FOV
+        double angle = acos((sensorOrigin - surfacePoint).normalized().dot(octomap::point3d(1, 0, 0)));
+        // return angle <= (fovAngle / 2.0);
+        return true;
+    }
+
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_sub_;
+};
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<RealSenseToMoveItNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

@@ -15,6 +15,9 @@ find_package(message_filters REQUIRED)
 find_package(pcl_msgs REQUIRED)
 find_package(urdf REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 # Include directories
 include_directories(
@@ -38,6 +41,9 @@ ament_target_dependencies(realsense_to_moveit
   pcl_msgs
   urdf
   visualization_msgs
+  tf2
+  tf2_ros
+  geometry_msgs
 )
 
 # Install the executable
