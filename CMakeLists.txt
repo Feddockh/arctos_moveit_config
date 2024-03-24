@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.5)
 project(arctos_moveit_config)
 
 # Find required ROS 2 packages
@@ -19,6 +19,13 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
+# Custom message requirements
+# find_package(rosidl_default_generators REQUIRED)
+# rosidl_generate_interfaces(${PROJECT_NAME}
+#   msg/ArctosJointState.msg
+# )
+# ament_export_dependencies(rosidl_default_runtime)
+
 # Include directories
 include_directories(
   include
@@ -26,7 +33,7 @@ include_directories(
   ${urdf_INCLUDE_DIRS}
 )
 
-# Declare a C++ executable
+# Declare C++ executables
 add_executable(realsense_to_moveit src/realsense_to_moveit_node.cpp)
 ament_target_dependencies(realsense_to_moveit
   rclcpp
@@ -46,9 +53,17 @@ ament_target_dependencies(realsense_to_moveit
   geometry_msgs
 )
 
+add_executable(serial_joint_state_publisher src/serial_joint_state_publisher.cpp)
+ament_target_dependencies(serial_joint_state_publisher
+  rclcpp
+  sensor_msgs
+  
+)
+
 # Install the executable
 install(TARGETS
   realsense_to_moveit
+  serial_joint_state_publisher
   DESTINATION lib/${PROJECT_NAME}
 )
 
