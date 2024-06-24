@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="arctos">
+    <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+
+    <!-- Import arctos urdf file -->
+    <xacro:include filename="$(find arctos_description)/urdf/arctos.urdf" />
+
+    <!-- Import control_xacro -->
+    <xacro:include filename="arctos.ros2_control.xacro" />
+
+    <!-- Import Realsense camera -->
+    <xacro:include filename="$(find realsense2_description)/urdf/_d435.urdf.xacro" />
+
+    <!-- Define where the camera is attached to the robot -->
+    <xacro:sensor_d435 parent="realsense_mount">
+        <origin xyz="0 0.038 0.02" rpy="${pi/2} -${pi/2} ${pi}" />
+    </xacro:sensor_d435>
+
+    <xacro:arctos_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)"/>
+
+</robot>
